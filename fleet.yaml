@@ -1,0 +1,135 @@
+# MuhDikhai on Fleet OS — the whole stack in one file.
+#
+#   postgres  the database, private to the fleet
+#   redis     sessions and the socket.io adapter, private to the fleet
+#   api       the PlasticWorld backend, publicly reachable
+#   website   the product site, publicly reachable
+#
+# Replace NODE_NAME below with the node you want the stateful services on
+# (`fleet nodes` lists them). Everything holding data is pinned there, because
+# a volume does not follow a service to another machine.
+#
+# Before the first deploy, set the credentials — they are never written here:
+#
+#   fleet secrets set POSTGRES_PASSWORD   # what the database is created with
+#   fleet secrets set DB_PASSWORD         # the SAME value; what the API connects with
+#   fleet secrets set JWT_SECRET          # openssl rand -base64 64
+#
+# POSTGRES_PASSWORD and DB_PASSWORD must match. Postgres initialises its
+# superuser from the first and the API authenticates with the second, so a
+# difference between them is a connection refused on the very first request.
+# They are two secrets rather than one because they belong to two services,
+# and only the service that declares a secret ever receives it.
+#
+# The images are built locally and pushed to the fleet registry; see the
+# deploy steps. Switch `image:` to `build:` once the repository is connected
+# to the fleet, at which point a git push deploys the pushed commit.
+
+fleet: homelab
+
+services:
+  # ── data ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    # No published port and no public hostname. Only its neighbours on this
+    # node can reach it, by the name `postgres`.
+    internal: true
+    placement: pinned
+    node: kakashi
+    # A new volume name, on purpose.
+    #
+    # Postgres reads POSTGRES_PASSWORD only when it initialises an empty data
+    # directory. plasticworld-pgdata was created by an earlier deploy and kept
+    # the password from then, so the API authenticated with the current secret
+    # and was refused — a mismatch no amount of re-setting the secret can fix,
+    # because the old directory simply ignores it.
+    #
+    # Pointing at a fresh name gets a directory Postgres will initialise with
+    # today's password, and leaves the old volume on the node untouched rather
+    # than destroying data to fix a credential problem. Delete the old one at
+    # leisure:  docker volume rm plasticworld-pgdata
+    volume: { name: plasticworld-pgdata-2, path: /var/lib/postgresql/data }
+    resources: { ram: 512Mi, cpu: 0.5 }
+    container_port: 5432
+    env:
+      POSTGRES_DB: plasticworld_db
+      POSTGRES_USER: postgres
+      # Postgres refuses to initialise into a directory that is not empty, and
+      # a mounted volume has a lost+found. Its own subdirectory avoids that.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets: [POSTGRES_PASSWORD]
+    # The probe speaks HTTP and Postgres does not, so there is no check to run.
+    # Its readiness shows up as the API becoming healthy.
+    health: { disabled: true }
+
+  redis:
+    image: redis:7-alpine
+    internal: true
+    placement: pinned
+    node: kakashi
+    volume: { name: plasticworld-redis, path: /data }
+    resources: { ram: 256Mi, cpu: 0.25 }
+    container_port: 6379
+    health: { disabled: true }
+
+  # ── application ─────────────────────────────────────────────────
+  api:
+    build: ./PlasticWorld
+    # Pinned to the same node as the data it talks to. Names resolve between
+    # services on one node, so splitting these would break the connection
+    # string rather than merely slow it down.
+    placement: pinned
+    node: kakashi
+    resources: { ram: 768Mi, cpu: 0.5 }
+    container_port: 3000
+    # src/app.ts serves /health. The scaffolded manifest said /healthz, which
+    # does not exist — with health-gated rollouts that means the deploy is
+    # never promoted and fails after the rollout window.
+    health: { path: /health, interval: 15s, timeout: 5s }
+    # Several modules write here at import time, and the image creates it owned
+    # by the runtime user. Without the volume, uploads live in the container
+    # and the next deploy discards them.
+    volume: { name: plasticworld-uploads, path: /app/public/uploads }
+    env:
+      NODE_ENV: production
+      PORT: 3000
+      API_VERSION: v1
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: plasticworld_db
+      DB_USER: postgres
+      DB_SSL: false
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Quoted: a trailing colon makes YAML read this as a nested mapping.
+      REDIS_KEY_PREFIX: "plasticworld:"
+      LOG_LEVEL: info
+      # Whatever origin the browser actually loads the site from. This is the
+      # website service's own managed hostname; a mismatch here is invisible
+      # server-side and shows up only as the browser refusing every API call.
+      CORS_ORIGIN: https://website-homelab-3f402a.plastikworld.xyz
+    # No DATABASE_URL. The API prefers it when a managed host hands one out,
+    # but falls back to the discrete DB_* vars above — which are already here.
+    # Setting both would put the same password in two places that can drift
+    # apart, and only one of them would be the one Postgres was created with.
+    secrets:
+      - JWT_SECRET
+      - DB_PASSWORD
+      # config/firebase.ts throws if any of these three is missing, and it runs
+      # before the database or Redis, so the whole API crash-loops without
+      # them. The project id and client email are not credentials on their own,
+      # but they are kept here rather than in `env` so the service account is
+      # not described in a file that gets committed.
+      - FIREBASE_PROJECT_ID
+      - FIREBASE_CLIENT_EMAIL
+      # A PEM with embedded newlines. firebase.ts turns literal \n back into
+      # real ones, so it does not matter which form the .env stores.
+      - FIREBASE_PRIVATE_KEY
+
+  # ── website ─────────────────────────────────────────────────────
+  website:
+    build: ./product-website
+    placement: flexible
+    resources: { ram: 128Mi, cpu: 0.25 }
+    container_port: 80
+    health: { path: / }

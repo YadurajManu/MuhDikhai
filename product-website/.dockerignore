@@ -1,0 +1,20 @@
+# Everything the build does not need.
+#
+# Without this the whole directory is sent to the daemon — 218MB of it, almost
+# all node_modules, which is then thrown away because the image installs its
+# own. The build also gets slower every time you run it locally.
+
+node_modules
+dist
+.git
+.gitignore
+.DS_Store
+*.log
+npm-debug.log*
+.env
+.env.*
+.vscode
+.idea
+Dockerfile
+.dockerignore
+README.md

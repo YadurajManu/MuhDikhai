@@ -12,7 +12,6 @@ import haveliService from '../services/haveli.service';
 import logger from '../utils/logger';
 import { createAdapter } from '@socket.io/redis-adapter';
 import redisClient from './redis';
-import geoip from 'geoip-lite';
 import { ExtendedError } from 'socket.io/dist/namespace';
 
 interface SocketUser {
@@ -121,13 +120,73 @@ function resolveClientIp(socket: AuthenticatedSocket): string | null {
   return candidates.find((ip) => !isPrivateOrLoopbackIp(ip)) || candidates[0];
 }
 
-function resolveEdgeGeo(socket: AuthenticatedSocket): { lat: number; long: number } | null {
+type EdgeGeo = {
+  lat: number | null;
+  long: number | null;
+  city: string | null;
+  country: string | null;
+  source: 'cloudflare' | 'vercel';
+};
+
+/** Vercel percent-encodes city names so the header stays ASCII. */
+function decodeHeaderText(value: string | string[] | undefined): string | null {
+  const raw = firstHeaderValue(value as string | string[]);
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw).trim() || null;
+  } catch {
+    return raw.trim() || null;
+  }
+}
+
+/**
+ * Where the client is, according to the edge that terminated its TLS.
+ *
+ * This used to know only Vercel's headers, which never arrive behind
+ * Cloudflare — so every connection fell through to a bundled IP database.
+ * That database cost 111MB in the image, went stale between dependency bumps,
+ * and answered a question the edge had already answered for free on the way
+ * in.
+ *
+ * Cloudflare sends CF-IPCountry whenever IP geolocation is on. Latitude,
+ * longitude and city arrive as well once the "Add visitor location headers"
+ * managed transform is enabled; without it the country still lands here, which
+ * is why coordinates are nullable rather than required.
+ */
+function resolveEdgeGeo(socket: AuthenticatedSocket): EdgeGeo | null {
   const headers = socket.handshake.headers || {};
-  const lat = parseHeaderNumber(headers['x-vercel-ip-latitude'] as string | string[]);
-  const long = parseHeaderNumber(headers['x-vercel-ip-longitude'] as string | string[]);
-  if (lat === null || long === null) return null;
-  if (!isValidLatLong(lat, long)) return null;
-  return { lat, long };
+
+  // "XX" is Cloudflare's answer for a client it cannot place — Tor exits and
+  // some satellite ranges — and means the same as no header at all.
+  const cfCountryRaw = firstHeaderValue(headers['cf-ipcountry'] as string | string[]);
+  const cfCountry = cfCountryRaw && cfCountryRaw !== 'XX' ? cfCountryRaw.trim() : null;
+  const cfCity = decodeHeaderText(headers['cf-ipcity']);
+  const cfLat = parseHeaderNumber(headers['cf-iplatitude'] as string | string[]);
+  const cfLong = parseHeaderNumber(headers['cf-iplongitude'] as string | string[]);
+
+  if (cfLat !== null && cfLong !== null && isValidLatLong(cfLat, cfLong)) {
+    return { lat: cfLat, long: cfLong, city: cfCity, country: cfCountry, source: 'cloudflare' };
+  }
+
+  const vLat = parseHeaderNumber(headers['x-vercel-ip-latitude'] as string | string[]);
+  const vLong = parseHeaderNumber(headers['x-vercel-ip-longitude'] as string | string[]);
+  if (vLat !== null && vLong !== null && isValidLatLong(vLat, vLong)) {
+    return {
+      lat: vLat,
+      long: vLong,
+      city: decodeHeaderText(headers['x-vercel-ip-city']),
+      country: firstHeaderValue(headers['x-vercel-ip-country'] as string | string[]),
+      source: 'vercel',
+    };
+  }
+
+  // A country with no coordinates is still worth recording. It cannot go on
+  // the map, but it is the field most of this telemetry is actually read for.
+  if (cfCountry || cfCity) {
+    return { lat: null, long: null, city: cfCity, country: cfCountry, source: 'cloudflare' };
+  }
+
+  return null;
 }
 
 // Store active users (userId -> Set of socketIds)
@@ -881,11 +940,22 @@ export function initializeSocket(httpServer: HTTPServer): SocketIOServer {
     activeUsers.get(userId)!.add(socket.id);
     
     // Geo telemetry priority:
-    // 1) Edge headers (Vercel etc), 2) IP lookup, 3) optional browser update event later.
+    // 1) Edge headers (Cloudflare, Vercel), 2) optional browser update event later.
+    //
+    // There is deliberately no IP-database fallback. The edge already resolved
+    // this on the way in, and the bundled database that used to answer when
+    // the headers were missing cost 111MB in the image for a field that is
+    // best-effort by design.
     const resolvedIp = resolveClientIp(socket);
     const edgeGeo = resolveEdgeGeo(socket);
     if (edgeGeo) {
-      pubClient.geoadd('presence:geo', edgeGeo.long, edgeGeo.lat, userId).catch((err) => logger.warn('Geo telemetry GEOADD failed', { error: err }));
+      if (edgeGeo.lat !== null && edgeGeo.long !== null) {
+        pubClient
+          .geoadd('presence:geo', edgeGeo.long, edgeGeo.lat, userId)
+          .catch((err) => logger.warn('Geo telemetry GEOADD failed', { error: err }));
+      }
+      // Stored even without coordinates: country alone is what most of this is
+      // read for, and the map simply skips a user it cannot place.
       pubClient
         .hset(
           `user:${userId}:meta`,
@@ -893,26 +963,18 @@ export function initializeSocket(httpServer: HTTPServer): SocketIOServer {
           JSON.stringify({
             lat: edgeGeo.lat,
             long: edgeGeo.long,
-            source: 'edge-header',
+            city: edgeGeo.city,
+            country: edgeGeo.country,
+            source: edgeGeo.source,
             ip: resolvedIp,
           })
         )
         .catch(() => {});
     } else {
-      const lookupIp = !resolvedIp || resolvedIp === '::1' || resolvedIp === '127.0.0.1'
-        ? '122.161.48.1' // Local/dev fallback to keep telemetry visible
-        : resolvedIp;
-      const geo = geoip.lookup(lookupIp);
-      if (geo?.ll?.length === 2) {
-        const [lat, long] = geo.ll;
-        if (isValidLatLong(lat, long)) {
-          pubClient.geoadd('presence:geo', long, lat, userId).catch((err) => logger.warn('Geo telemetry GEOADD failed', { error: err }));
-          // Store user's last known location for API visibility
-          pubClient.hset(`user:${userId}:meta`, 'location', JSON.stringify({ lat, long, city: geo.city, country: geo.country, source: 'geoip', ip: resolvedIp })).catch(() => {});
-        }
-      } else {
-        logger.debug('Geo lookup unavailable for socket connection', { userId, ip: resolvedIp });
-      }
+      // Normal in local development, where nothing sits in front of the app.
+      // The browser geolocation handler below still fills this in if the user
+      // grants permission.
+      logger.debug('No edge geo headers on socket connection', { userId, ip: resolvedIp });
     }
 
     // Join user's personal room
